@@ -43,6 +43,10 @@ async def get_db() -> AsyncSession:
 
 async def init_db() -> None:
     """Create all tables if they don't exist (dev / single-user mode)."""
-    from app.models import *  # noqa: F401, F403 — import all models to register metadata
+    import app.models.user 
+    import app.models.document 
+    import app.models.analysis 
+    import app.models.job 
+    import app.models.profile  # noqa: F401, F403 — import all models to register metadata
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
