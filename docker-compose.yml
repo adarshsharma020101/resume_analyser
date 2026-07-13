@@ -1,0 +1,172 @@
+version: "3.9"
+
+# ============================================================
+# ATS Analyzer — fully local, privacy-first
+# All services run on localhost / Docker-internal network only.
+# No external ports are exposed except the frontend and backend.
+# ============================================================
+
+networks:
+  ats_internal:
+    driver: bridge
+    internal: false   # allows localhost → container; set true to fully isolate
+  ollama_net:
+    driver: bridge
+
+volumes:
+  ollama_data:
+  app_data:
+  chroma_data:
+
+services:
+
+  # ── Ollama ──────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ats_ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"   # localhost only — no external access
+    networks:
+      - ats_internal
+      - ollama_net
+    environment:
+      - OLLAMA_ORIGINS=http://backend:8000,http://mcp_server:8001
+      - OLLAMA_HOST=0.0.0.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Remove the deploy.resources block if you have no GPU
+
+  # ── Ollama model pull (one-shot init) ─────────────────────
+  ollama_init:
+    image: ollama/ollama:latest
+    container_name: ats_ollama_init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - ats_internal
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./scripts/pull_models.sh:/pull_models.sh:ro
+    entrypoint: ["/bin/sh", "/pull_models.sh"]
+    environment:
+      - OLLAMA_HOST=ollama:11434
+      - OLLAMA_LLM_MODEL=${OLLAMA_LLM_MODEL:-qwen2.5:7b}
+      - OLLAMA_EMBED_MODEL=${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+    restart: "no"
+
+  # ── ChromaDB ────────────────────────────────────────────────
+  chromadb:
+    image: chromadb/chroma:0.5.3
+    container_name: ats_chromadb
+    restart: unless-stopped
+    volumes:
+      - chroma_data:/chroma/chroma
+    ports:
+      - "127.0.0.1:8002:8000"   # localhost only
+    networks:
+      - ats_internal
+    environment:
+      - CHROMA_SERVER_AUTHN_CREDENTIALS=${CHROMA_AUTH_TOKEN:-local_chroma_secret}
+      - CHROMA_SERVER_AUTHN_PROVIDER=chromadb.auth.token_authn.TokenAuthenticationServerProvider
+      - ALLOW_RESET=false
+      - ANONYMIZED_TELEMETRY=false
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  # ── Backend (FastAPI) ────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ats_backend
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    volumes:
+      - app_data:/app/data
+      - ./backend:/app/src:ro   # source mount for dev; remove for prod
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      - ats_internal
+    env_file:
+      - .env
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - CHROMA_HOST=http://chromadb:8000
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/db/ats_analyzer.db
+      - UPLOAD_DIR=/app/data/uploads
+      - REPORTS_DIR=/app/data/reports
+      - DATA_DIR=/app/data
+      - BLOCK_EXTERNAL_NETWORK=true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    command: >
+      sh -c "python -m alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"
+
+  # ── MCP Server ───────────────────────────────────────────────
+  mcp_server:
+    build:
+      context: ./mcp_server
+      dockerfile: Dockerfile
+    container_name: ats_mcp_server
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8001:8001"
+    networks:
+      - ats_internal
+    env_file:
+      - .env
+    environment:
+      - BACKEND_URL=http://backend:8000
+      - MCP_HTTP_PORT=8001
+      - BLOCK_EXTERNAL_NETWORK=true
+
+  # ── Frontend (React + Vite) ──────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://localhost:8000}
+    container_name: ats_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "127.0.0.1:3000:80"
+    networks:
+      - ats_internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
